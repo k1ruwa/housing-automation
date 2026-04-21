@@ -1,9 +1,8 @@
 """
 Pararius Amsterdam scraper.
 
-Uses Playwright to handle the JS-rendered listing pages.
-Paginates the search results, then fetches each detail page.
-Fails loudly on selector mismatches — never inserts silent garbage.
+Search/pagination: Playwright (JS-rendered results page).
+Detail pages: httpx plain HTTP GET (bypasses headless-browser fingerprinting).
 """
 
 import random
@@ -11,15 +10,28 @@ import re
 import time
 from urllib.parse import urljoin
 
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
+import httpx
+from playwright.sync_api import sync_playwright, Page
 
-BASE_URL = "https://www.pararius.com"
+BASE_URL   = "https://www.pararius.com"
 SEARCH_URL = f"{BASE_URL}/apartments/amsterdam"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+HEADERS = {
+    "User-Agent":                USER_AGENT,
+    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language":           "en-US,en;q=0.9,nl;q=0.8",
+    "Accept-Encoding":           "gzip, deflate, br",
+    "Connection":                "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest":            "document",
+    "Sec-Fetch-Mode":            "navigate",
+    "Sec-Fetch-Site":            "none",
+    "Sec-Fetch-User":            "?1",
+}
 
 
 def _random_delay(lo: float = 2.0, hi: float = 5.0) -> None:
@@ -28,128 +40,113 @@ def _random_delay(lo: float = 2.0, hi: float = 5.0) -> None:
 
 def _extract_external_id(url: str) -> str:
     """
-    Pull the Pararius listing ID from a URL path segment.
-
-    e.g. /apartment-for-rent/amsterdam/b136c8bf/henrick-de-keijserplein
-         → b136c8bf
+    /apartment-for-rent/amsterdam/b136c8bf/henrick-de-keijserplein → b136c8bf
     """
-    # The ID is the segment after the city name — a short hex-like token
     parts = url.rstrip("/").split("/")
-    # URL pattern: /apartment-for-rent/<city>/<id>/<slug>
-    # city is index -3 from end when slug is present, -2 when not
     for i, part in enumerate(parts):
-        if part in ("amsterdam",) and i + 1 < len(parts):
+        if part == "amsterdam" and i + 1 < len(parts):
             return parts[i + 1]
     raise ValueError(f"Cannot extract external_id from URL: {url}")
 
 
 def _parse_price(text: str) -> float | None:
-    """'€2,995 pcm' or '€ 2.995 per month' → 2995.0"""
+    """'€2,995 pcm' → 2995.0"""
     digits = re.sub(r"[^\d]", "", text)
     return float(digits) if digits else None
 
 
 def _parse_size(text: str) -> float | None:
     """'93 m²' → 93.0"""
-    match = re.search(r"(\d+(?:[.,]\d+)?)", text)
-    return float(match.group(1).replace(",", ".")) if match else None
+    m = re.search(r"(\d+(?:[.,]\d+)?)", text)
+    return float(m.group(1).replace(",", ".")) if m else None
 
 
 def _parse_bedrooms(text: str) -> int | None:
-    """'3 rooms' or '2' → int"""
-    match = re.search(r"(\d+)", text)
-    return int(match.group(1)) if match else None
+    m = re.search(r"(\d+)", text)
+    return int(m.group(1)) if m else None
 
 
 def _parse_address_from_title(title: str) -> str | None:
-    """
-    'For rent: Flat Henrick de Keijserplein in Amsterdam' → 'Henrick de Keijserplein'
-    """
-    # Strip 'For rent: <type> ' prefix
-    match = re.match(r"For rent:\s+\S+\s+(.+?)\s+in\s+\S.*$", title, re.IGNORECASE)
-    return match.group(1).strip() if match else title
+    """'For rent: Flat Henrick de Keijserplein in Amsterdam' → 'Henrick de Keijserplein'"""
+    m = re.match(r"For rent:\s+\S+\s+(.+?)\s+in\s+\S.*$", title, re.IGNORECASE)
+    return m.group(1).strip() if m else title
 
 
-def _feature_value(page: Page, term_label: str) -> str | None:
+def _html_text(html: str, pattern: str) -> str | None:
+    """Extract inner text using a regex on raw HTML, stripping tags."""
+    m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return None
+    raw = m.group(1)
+    # Strip HTML tags and decode basic entities
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = text.replace("&amp;", "&").replace("&nbsp;", " ").replace("&#39;", "'")
+    return re.sub(r"\s+", " ", text).strip() or None
+
+
+def _feature_value_html(html: str, term_label: str) -> str | None:
     """
-    Read a value from the listing-features key→value table by its term label.
-    Pararius renders these as <dt class='listing-features__term'> / <dd> pairs.
+    Find a value in the listing-features key→value table by term label.
+    Pararius SSR HTML pattern:
+      <dt class='listing-features__term'>Available</dt>
+      <dd class='listing-features__description ...'>
+        <span class='listing-features__main-description'>From 15-05-2026</span>
+      </dd>
     """
-    return page.evaluate(
-        """(label) => {
-            const terms = document.querySelectorAll('.listing-features__term');
-            for (const term of terms) {
-                if (term.textContent.trim() === label) {
-                    const desc = term.nextElementSibling;
-                    if (!desc) return null;
-                    const main = desc.querySelector('.listing-features__main-description');
-                    return (main || desc).textContent.trim() || null;
-                }
-            }
-            return null;
-        }""",
-        term_label,
+    # Escape the label for regex
+    escaped = re.escape(term_label)
+    pattern = (
+        rf"listing-features__term[^>]*>\s*{escaped}\s*</\w+>"   # the <dt> with our label
+        r".*?"                                                     # skip to the <dd>
+        r"listing-features__main-description[^>]*>(.*?)</span>"   # the value span
     )
+    return _html_text(html, pattern)
 
 
-def _scrape_detail(page: Page, url: str) -> dict:
-    """Fetch a single listing detail page and extract all fields."""
-    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+def _scrape_detail_httpx(url: str) -> dict:
+    """
+    Fetch a listing detail page via plain HTTP GET and parse the SSR HTML.
+    Avoids all headless-browser fingerprinting that blocks Playwright after
+    the first request.
+    """
+    resp = httpx.get(url, headers=HEADERS, follow_redirects=True, timeout=20)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code} fetching {url}")
 
-    # Wait for the title — ensures JS has rendered the key elements.
-    # Timeout is generous (20s); if the title never appears the listing is
-    # likely expired, removed, or behind a redirect — caller should skip it.
-    try:
-        page.wait_for_selector("h1.listing-detail-summary__title", timeout=20_000)
-    except PWTimeout:
+    html = resp.text
+
+    # Confirm this is actually a listing page
+    title_raw = _html_text(html, r'<h1[^>]*listing-detail-summary__title[^>]*>(.*?)</h1>')
+    if not title_raw:
         raise RuntimeError(
-            f"Title element never appeared on {url} — "
-            "listing may be expired or removed."
+            f"Title not found in HTML — page may be blocked or listing removed: {url}"
         )
 
-    raw_html = page.content()
+    title        = title_raw
+    address      = _parse_address_from_title(title)
+    neighborhood = _html_text(html, r'<span[^>]*listing-detail-summary__location[^>]*>(.*?)</span>')
 
-    def _text(selector: str, required: bool = False) -> str | None:
-        el = page.query_selector(selector)
-        if el is None:
-            if required:
-                raise RuntimeError(
-                    f"Required selector '{selector}' not found on {url} — "
-                    "Pararius layout may have changed."
-                )
-            return None
-        return el.inner_text().strip() or None
+    price_raw    = _html_text(html, r'<span[^>]*listing-detail-summary__price-main[^>]*>(.*?)</span>')
+    price_eur    = _parse_price(price_raw) if price_raw else None
 
-    title       = _text("h1.listing-detail-summary__title", required=True)
-    address     = _parse_address_from_title(title) if title else None
-    neighborhood = _text(".listing-detail-summary__location")
+    size_raw     = _html_text(html, r'<li[^>]*illustrated-features__item--surface-area[^>]*>(.*?)</li>')
+    size_m2      = _parse_size(size_raw) if size_raw else None
 
-    # Price: use the more specific -main variant to avoid picking up similar-listings prices
-    price_text  = _text(".listing-detail-summary__price-main")
-    price_eur   = _parse_price(price_text) if price_text else None
-
-    # Size and rooms from the illustrated features strip
-    size_text   = _text(".illustrated-features__item--surface-area")
-    size_m2     = _parse_size(size_text) if size_text else None
-
-    # Prefer explicit bedroom count; fall back to total rooms
-    bedrooms_raw = _feature_value(page, "Number of bedrooms")
+    bedrooms_raw = _feature_value_html(html, "Number of bedrooms")
     if bedrooms_raw:
         bedrooms = _parse_bedrooms(bedrooms_raw)
     else:
-        rooms_text = _text(".illustrated-features__item--number-of-rooms")
-        bedrooms   = _parse_bedrooms(rooms_text) if rooms_text else None
+        rooms_raw = _html_text(html, r'<li[^>]*illustrated-features__item--number-of-rooms[^>]*>(.*?)</li>')
+        bedrooms  = _parse_bedrooms(rooms_raw) if rooms_raw else None
 
-    # Available-from from the features key-value table
-    available_raw  = _feature_value(page, "Available")
+    available_raw  = _feature_value_html(html, "Available")
     available_from: str | None = None
     if available_raw:
-        date_match = re.search(r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", available_raw)
-        available_from = date_match.group(1) if date_match else available_raw[:50]
+        date_m = re.search(r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", available_raw)
+        available_from = date_m.group(1) if date_m else available_raw[:50]
 
-    description = _text(".listing-detail-description__additional")
-
-    external_id = _extract_external_id(url)
+    description  = _html_text(html, r'<div[^>]*listing-detail-description__additional[^>]*>(.*?)</div>')
+    external_id  = _extract_external_id(url)
 
     return {
         "source":         "pararius",
@@ -163,7 +160,7 @@ def _scrape_detail(page: Page, url: str) -> dict:
         "bedrooms":       bedrooms,
         "available_from": available_from,
         "description":    description,
-        "raw_html":       raw_html,
+        "raw_html":       html,
     }
 
 
@@ -190,7 +187,6 @@ def _collect_listing_urls(page: Page) -> list[str]:
         next_btn = page.query_selector("a[rel='next']")
         if not next_btn:
             break
-
         next_href = next_btn.get_attribute("href")
         if not next_href:
             break
@@ -204,48 +200,40 @@ def _collect_listing_urls(page: Page) -> list[str]:
 def scrape() -> list[dict]:
     """
     Entry point: scrape all active Pararius Amsterdam listings.
-    Returns a list of listing dicts ready for db.upsert_listing().
 
-    Uses two separate browser contexts:
-    - ctx1 collects listing URLs from search pages (consent state irrelevant)
-    - ctx2 visits each detail URL fresh, which sidesteps the consent-cookie
-      state that search pages leave behind and causes detail pages to render blank.
+    - Playwright: collects listing URLs from the JS-rendered search pages
+    - httpx: fetches each detail page as a plain HTTP request (no browser
+      fingerprint, bypasses Pararius bot-detection that blocks headless Chrome
+      after the first request)
     """
     listings: list[dict] = []
 
+    # Phase 1 — collect listing URLs via Playwright (search pages need JS)
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-
-        # Phase 1 — collect all listing URLs
-        ctx1  = browser.new_context(user_agent=USER_AGENT)
-        page1 = ctx1.new_page()
-        listing_urls = _collect_listing_urls(page1)
-        ctx1.close()
-        print(f"[pararius] found {len(listing_urls)} listings across all pages")
-
-        # Phase 2 — fresh context per listing so every visit looks like a new
-        # session to Pararius (sharing one context burns the session after
-        # the first request and causes all subsequent pages to render blank).
-        failed = 0
-        for i, url in enumerate(listing_urls, 1):
-            ctx  = browser.new_context(user_agent=USER_AGENT)
-            page = ctx.new_page()
-            try:
-                _random_delay(5.0, 15.0)
-                listing = _scrape_detail(page, url)
-                listings.append(listing)
-                print(f"[pararius] scraped {i}/{len(listing_urls)}: {listing['external_id']}")
-            except Exception as e:
-                failed += 1
-                print(f"[pararius] SKIP {i}/{len(listing_urls)} ({url}): {e}")
-                if failed > len(listing_urls) // 2:
-                    raise RuntimeError(
-                        f"Too many failures ({failed}/{i}) — Pararius layout "
-                        "may have changed or bot-detection kicked in."
-                    )
-            finally:
-                ctx.close()
-
+        ctx     = browser.new_context(user_agent=USER_AGENT)
+        page    = ctx.new_page()
+        listing_urls = _collect_listing_urls(page)
+        ctx.close()
         browser.close()
+
+    print(f"[pararius] found {len(listing_urls)} listings across all pages")
+
+    # Phase 2 — scrape detail pages via httpx (no browser = no fingerprint)
+    failed = 0
+    for i, url in enumerate(listing_urls, 1):
+        try:
+            _random_delay()
+            listing = _scrape_detail_httpx(url)
+            listings.append(listing)
+            print(f"[pararius] scraped {i}/{len(listing_urls)}: {listing['external_id']}")
+        except Exception as e:
+            failed += 1
+            print(f"[pararius] SKIP {i}/{len(listing_urls)} ({url}): {e}")
+            if failed > len(listing_urls) // 2:
+                raise RuntimeError(
+                    f"Too many failures ({failed}/{i}) — Pararius layout "
+                    "may have changed or requests are being blocked."
+                )
 
     return listings
