@@ -223,15 +223,16 @@ def scrape() -> list[dict]:
         ctx1.close()
         print(f"[pararius] found {len(listing_urls)} listings across all pages")
 
-        # Phase 2 — fresh context, scrape each detail URL directly
-        ctx2  = browser.new_context(user_agent=USER_AGENT)
-        page2 = ctx2.new_page()
-
+        # Phase 2 — fresh context per listing so every visit looks like a new
+        # session to Pararius (sharing one context burns the session after
+        # the first request and causes all subsequent pages to render blank).
         failed = 0
         for i, url in enumerate(listing_urls, 1):
+            ctx  = browser.new_context(user_agent=USER_AGENT)
+            page = ctx.new_page()
             try:
-                _random_delay()
-                listing = _scrape_detail(page2, url)
+                _random_delay(5.0, 15.0)
+                listing = _scrape_detail(page, url)
                 listings.append(listing)
                 print(f"[pararius] scraped {i}/{len(listing_urls)}: {listing['external_id']}")
             except Exception as e:
@@ -242,8 +243,9 @@ def scrape() -> list[dict]:
                         f"Too many failures ({failed}/{i}) — Pararius layout "
                         "may have changed or bot-detection kicked in."
                     )
+            finally:
+                ctx.close()
 
-        ctx2.close()
         browser.close()
 
     return listings
