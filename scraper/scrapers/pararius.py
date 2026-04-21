@@ -28,38 +28,83 @@ def _random_delay(lo: float = 2.0, hi: float = 5.0) -> None:
 
 def _extract_external_id(url: str) -> str:
     """
-    Pull the Pararius listing ID from a URL.
+    Pull the Pararius listing ID from a URL path segment.
 
-    e.g. /apartment-for-rent/amsterdam/PR00012345678/...
-         → PR00012345678
+    e.g. /apartment-for-rent/amsterdam/b136c8bf/henrick-de-keijserplein
+         → b136c8bf
     """
-    match = re.search(r"/(PR\d+)", url)
-    if not match:
-        raise ValueError(f"Cannot extract external_id from URL: {url}")
-    return match.group(1)
+    # The ID is the segment after the city name — a short hex-like token
+    parts = url.rstrip("/").split("/")
+    # URL pattern: /apartment-for-rent/<city>/<id>/<slug>
+    # city is index -3 from end when slug is present, -2 when not
+    for i, part in enumerate(parts):
+        if part in ("amsterdam",) and i + 1 < len(parts):
+            return parts[i + 1]
+    raise ValueError(f"Cannot extract external_id from URL: {url}")
 
 
 def _parse_price(text: str) -> float | None:
-    """'€ 1.950 per month' → 1950.0"""
+    """'€2,995 pcm' or '€ 2.995 per month' → 2995.0"""
     digits = re.sub(r"[^\d]", "", text)
     return float(digits) if digits else None
 
 
 def _parse_size(text: str) -> float | None:
-    """'75 m²' → 75.0"""
+    """'93 m²' → 93.0"""
     match = re.search(r"(\d+(?:[.,]\d+)?)", text)
     return float(match.group(1).replace(",", ".")) if match else None
 
 
 def _parse_bedrooms(text: str) -> int | None:
-    """'3 bedrooms' → 3"""
+    """'3 rooms' or '2' → int"""
     match = re.search(r"(\d+)", text)
     return int(match.group(1)) if match else None
+
+
+def _parse_address_from_title(title: str) -> str | None:
+    """
+    'For rent: Flat Henrick de Keijserplein in Amsterdam' → 'Henrick de Keijserplein'
+    """
+    # Strip 'For rent: <type> ' prefix
+    match = re.match(r"For rent:\s+\S+\s+(.+?)\s+in\s+\S.*$", title, re.IGNORECASE)
+    return match.group(1).strip() if match else title
+
+
+def _feature_value(page: Page, term_label: str) -> str | None:
+    """
+    Read a value from the listing-features key→value table by its term label.
+    Pararius renders these as <dt class='listing-features__term'> / <dd> pairs.
+    """
+    return page.evaluate(
+        """(label) => {
+            const terms = document.querySelectorAll('.listing-features__term');
+            for (const term of terms) {
+                if (term.textContent.trim() === label) {
+                    const desc = term.nextElementSibling;
+                    if (!desc) return null;
+                    const main = desc.querySelector('.listing-features__main-description');
+                    return (main || desc).textContent.trim() || null;
+                }
+            }
+            return null;
+        }""",
+        term_label,
+    )
 
 
 def _scrape_detail(page: Page, url: str) -> dict:
     """Fetch a single listing detail page and extract all fields."""
     page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+    # Wait for the title — ensures JS has rendered the key elements
+    try:
+        page.wait_for_selector("h1.listing-detail-summary__title", timeout=10_000)
+    except PWTimeout:
+        raise RuntimeError(
+            f"Title element never appeared on {url} — "
+            "possible bot-detection or consent wall."
+        )
+
     raw_html = page.content()
 
     def _text(selector: str, required: bool = False) -> str | None:
@@ -73,61 +118,61 @@ def _scrape_detail(page: Page, url: str) -> dict:
             return None
         return el.inner_text().strip() or None
 
-    title = _text("h1.listing-detail-summary__title", required=True)
-    address = _text(".listing-detail-summary__address")
+    title       = _text("h1.listing-detail-summary__title", required=True)
+    address     = _parse_address_from_title(title) if title else None
     neighborhood = _text(".listing-detail-summary__location")
 
-    price_text = _text(".listing-detail-summary__price")
-    price_eur = _parse_price(price_text) if price_text else None
+    # Price: use the more specific -main variant to avoid picking up similar-listings prices
+    price_text  = _text(".listing-detail-summary__price-main")
+    price_eur   = _parse_price(price_text) if price_text else None
 
-    size_text = _text(
-        ".listing-features__main-feature--surface-area .listing-features__main-feature-item"
-    )
-    size_m2 = _parse_size(size_text) if size_text else None
+    # Size and rooms from the illustrated features strip
+    size_text   = _text(".illustrated-features__item--surface-area")
+    size_m2     = _parse_size(size_text) if size_text else None
 
-    bedrooms_text = _text(
-        ".listing-features__main-feature--number-of-rooms .listing-features__main-feature-item"
-    )
-    bedrooms = _parse_bedrooms(bedrooms_text) if bedrooms_text else None
+    # Prefer explicit bedroom count; fall back to total rooms
+    bedrooms_raw = _feature_value(page, "Number of bedrooms")
+    if bedrooms_raw:
+        bedrooms = _parse_bedrooms(bedrooms_raw)
+    else:
+        rooms_text = _text(".illustrated-features__item--number-of-rooms")
+        bedrooms   = _parse_bedrooms(rooms_text) if rooms_text else None
 
-    available_text = _text(".listing-features__sub-description--available")
-    # Normalise to YYYY-MM-DD if possible, otherwise store raw
+    # Available-from from the features key-value table
+    available_raw  = _feature_value(page, "Available")
     available_from: str | None = None
-    if available_text:
-        date_match = re.search(r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}-\d{2}-\d{2})", available_text)
-        available_from = date_match.group(1) if date_match else available_text[:50]
+    if available_raw:
+        date_match = re.search(r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", available_raw)
+        available_from = date_match.group(1) if date_match else available_raw[:50]
 
-    description = _text(".listing-detail-description__additional p")
+    description = _text(".listing-detail-description__additional")
 
     external_id = _extract_external_id(url)
 
     return {
-        "source": "pararius",
-        "external_id": external_id,
-        "url": url,
-        "title": title,
-        "address": address,
-        "neighborhood": neighborhood,
-        "price_eur": price_eur,
-        "size_m2": size_m2,
-        "bedrooms": bedrooms,
+        "source":         "pararius",
+        "external_id":    external_id,
+        "url":            url,
+        "title":          title,
+        "address":        address,
+        "neighborhood":   neighborhood,
+        "price_eur":      price_eur,
+        "size_m2":        size_m2,
+        "bedrooms":       bedrooms,
         "available_from": available_from,
-        "description": description,
-        "raw_html": raw_html,
+        "description":    description,
+        "raw_html":       raw_html,
     }
 
 
 def _collect_listing_urls(page: Page) -> list[str]:
-    """
-    Paginate the Pararius Amsterdam search results and return all listing URLs.
-    """
+    """Paginate the Pararius Amsterdam search results and return all listing URLs."""
     urls: list[str] = []
     current_url = SEARCH_URL
 
     while True:
         page.goto(current_url, wait_until="domcontentloaded", timeout=30_000)
 
-        # All listing links on the results page
         anchors = page.query_selector_all("a.listing-search-item__link--title")
         if not anchors:
             raise RuntimeError(
@@ -140,7 +185,6 @@ def _collect_listing_urls(page: Page) -> list[str]:
             if href:
                 urls.append(urljoin(BASE_URL, href))
 
-        # Next page
         next_btn = page.query_selector("a[rel='next']")
         if not next_btn:
             break
@@ -165,7 +209,7 @@ def scrape() -> list[dict]:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(user_agent=USER_AGENT)
-        page = context.new_page()
+        page    = context.new_page()
 
         listing_urls = _collect_listing_urls(page)
         print(f"[pararius] found {len(listing_urls)} listings across all pages")
