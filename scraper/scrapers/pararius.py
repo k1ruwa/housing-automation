@@ -96,13 +96,15 @@ def _scrape_detail(page: Page, url: str) -> dict:
     """Fetch a single listing detail page and extract all fields."""
     page.goto(url, wait_until="domcontentloaded", timeout=30_000)
 
-    # Wait for the title — ensures JS has rendered the key elements
+    # Wait for the title — ensures JS has rendered the key elements.
+    # Timeout is generous (20s); if the title never appears the listing is
+    # likely expired, removed, or behind a redirect — caller should skip it.
     try:
-        page.wait_for_selector("h1.listing-detail-summary__title", timeout=10_000)
+        page.wait_for_selector("h1.listing-detail-summary__title", timeout=20_000)
     except PWTimeout:
         raise RuntimeError(
             f"Title element never appeared on {url} — "
-            "possible bot-detection or consent wall."
+            "listing may be expired or removed."
         )
 
     raw_html = page.content()
@@ -214,14 +216,23 @@ def scrape() -> list[dict]:
         listing_urls = _collect_listing_urls(page)
         print(f"[pararius] found {len(listing_urls)} listings across all pages")
 
+        failed = 0
         for i, url in enumerate(listing_urls, 1):
             try:
                 _random_delay()
                 listing = _scrape_detail(page, url)
                 listings.append(listing)
                 print(f"[pararius] scraped {i}/{len(listing_urls)}: {listing['external_id']}")
-            except PWTimeout:
-                raise RuntimeError(f"Timeout loading detail page: {url}")
+            except Exception as e:
+                failed += 1
+                print(f"[pararius] SKIP {i}/{len(listing_urls)} ({url}): {e}")
+                # If more than half the listings are failing something is
+                # structurally wrong — abort so the caller sends an error alert.
+                if failed > len(listing_urls) // 2:
+                    raise RuntimeError(
+                        f"Too many failures ({failed}/{i}) — Pararius layout "
+                        "may have changed or bot-detection kicked in."
+                    )
 
         browser.close()
 
