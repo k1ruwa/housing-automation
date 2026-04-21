@@ -174,9 +174,9 @@ def _dismiss_consent(page: Page) -> None:
     render as blank pages.
     """
     try:
-        btn = page.locator("button.button--primary", has_text="I understand").first
-        if btn.count() > 0:
-            btn.click(timeout=5_000)
+        locator = page.locator("button.button--primary", has_text="I understand")
+        if locator.count() > 0:
+            locator.first.click(timeout=5_000)
             print("[pararius] consent dialog dismissed")
     except Exception:
         pass  # Dialog may not appear every time — safe to ignore
