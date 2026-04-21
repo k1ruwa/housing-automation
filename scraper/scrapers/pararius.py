@@ -167,6 +167,21 @@ def _scrape_detail(page: Page, url: str) -> dict:
     }
 
 
+def _dismiss_consent(page: Page) -> None:
+    """
+    Click the 'I understand' privacy dialog that Pararius shows on first visit.
+    Without this the browser context has no consent cookie and detail pages
+    render as blank pages.
+    """
+    try:
+        btn = page.locator("button.button--primary", has_text="I understand").first
+        if btn.count() > 0:
+            btn.click(timeout=5_000)
+            print("[pararius] consent dialog dismissed")
+    except Exception:
+        pass  # Dialog may not appear every time — safe to ignore
+
+
 def _collect_listing_urls(page: Page) -> list[str]:
     """Paginate the Pararius Amsterdam search results and return all listing URLs."""
     urls: list[str] = []
@@ -174,6 +189,10 @@ def _collect_listing_urls(page: Page) -> list[str]:
 
     while True:
         page.goto(current_url, wait_until="domcontentloaded", timeout=30_000)
+
+        # Dismiss consent dialog on first search page load
+        if not urls:
+            _dismiss_consent(page)
 
         anchors = page.query_selector_all("a.listing-search-item__link--title")
         if not anchors:
