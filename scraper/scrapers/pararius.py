@@ -167,21 +167,6 @@ def _scrape_detail(page: Page, url: str) -> dict:
     }
 
 
-def _dismiss_consent(page: Page) -> None:
-    """
-    Click the 'I understand' privacy dialog that Pararius shows on first visit.
-    Without this the browser context has no consent cookie and detail pages
-    render as blank pages.
-    """
-    try:
-        locator = page.locator("button.button--primary", has_text="I understand")
-        if locator.count() > 0:
-            locator.first.click(timeout=5_000)
-            print("[pararius] consent dialog dismissed")
-    except Exception:
-        pass  # Dialog may not appear every time — safe to ignore
-
-
 def _collect_listing_urls(page: Page) -> list[str]:
     """Paginate the Pararius Amsterdam search results and return all listing URLs."""
     urls: list[str] = []
@@ -189,10 +174,6 @@ def _collect_listing_urls(page: Page) -> list[str]:
 
     while True:
         page.goto(current_url, wait_until="domcontentloaded", timeout=30_000)
-
-        # Dismiss consent dialog on first search page load
-        if not urls:
-            _dismiss_consent(page)
 
         anchors = page.query_selector_all("a.listing-search-item__link--title")
         if not anchors:
@@ -224,35 +205,45 @@ def scrape() -> list[dict]:
     """
     Entry point: scrape all active Pararius Amsterdam listings.
     Returns a list of listing dicts ready for db.upsert_listing().
+
+    Uses two separate browser contexts:
+    - ctx1 collects listing URLs from search pages (consent state irrelevant)
+    - ctx2 visits each detail URL fresh, which sidesteps the consent-cookie
+      state that search pages leave behind and causes detail pages to render blank.
     """
     listings: list[dict] = []
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=USER_AGENT)
-        page    = context.new_page()
 
-        listing_urls = _collect_listing_urls(page)
+        # Phase 1 — collect all listing URLs
+        ctx1  = browser.new_context(user_agent=USER_AGENT)
+        page1 = ctx1.new_page()
+        listing_urls = _collect_listing_urls(page1)
+        ctx1.close()
         print(f"[pararius] found {len(listing_urls)} listings across all pages")
+
+        # Phase 2 — fresh context, scrape each detail URL directly
+        ctx2  = browser.new_context(user_agent=USER_AGENT)
+        page2 = ctx2.new_page()
 
         failed = 0
         for i, url in enumerate(listing_urls, 1):
             try:
                 _random_delay()
-                listing = _scrape_detail(page, url)
+                listing = _scrape_detail(page2, url)
                 listings.append(listing)
                 print(f"[pararius] scraped {i}/{len(listing_urls)}: {listing['external_id']}")
             except Exception as e:
                 failed += 1
                 print(f"[pararius] SKIP {i}/{len(listing_urls)} ({url}): {e}")
-                # If more than half the listings are failing something is
-                # structurally wrong — abort so the caller sends an error alert.
                 if failed > len(listing_urls) // 2:
                     raise RuntimeError(
                         f"Too many failures ({failed}/{i}) — Pararius layout "
                         "may have changed or bot-detection kicked in."
                     )
 
+        ctx2.close()
         browser.close()
 
     return listings
