@@ -103,13 +103,18 @@ def _feature_value_html(html: str, term_label: str) -> str | None:
     return _html_text(html, pattern)
 
 
-def _scrape_detail_httpx(url: str) -> dict:
+def _scrape_detail_httpx(url: str, cookies: dict[str, str] | None = None) -> dict:
     """
     Fetch a listing detail page via plain HTTP GET and parse the SSR HTML.
     Avoids all headless-browser fingerprinting that blocks Playwright after
     the first request.
     """
-    resp = httpx.get(url, headers=HEADERS, follow_redirects=True, timeout=20)
+    resp = httpx.get(url, headers=HEADERS, cookies=cookies or {}, follow_redirects=True, timeout=20)
+    if resp.status_code == 403:
+        # Rate-limited — back off and retry once
+        print(f"[pararius] 403 on {url}, backing off 60s …")
+        time.sleep(60)
+        resp = httpx.get(url, headers=HEADERS, cookies=cookies or {}, follow_redirects=True, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code} fetching {url}")
 
@@ -164,8 +169,12 @@ def _scrape_detail_httpx(url: str) -> dict:
     }
 
 
-def _collect_listing_urls(page: Page) -> list[str]:
-    """Paginate the Pararius Amsterdam search results and return all listing URLs."""
+def _collect_listing_urls(page: Page) -> tuple[list[str], dict[str, str]]:
+    """
+    Paginate the Pararius Amsterdam search results.
+    Returns (listing_urls, cookies) — cookies are passed to httpx so detail
+    page requests look like a continuation of a real browser session.
+    """
     urls: list[str] = []
     current_url = SEARCH_URL
 
@@ -194,7 +203,10 @@ def _collect_listing_urls(page: Page) -> list[str]:
         current_url = urljoin(BASE_URL, next_href)
         _random_delay()
 
-    return urls
+    # Extract session cookies to pass to httpx requests
+    raw_cookies = page.context.cookies()
+    cookies = {c["name"]: c["value"] for c in raw_cookies if "pararius" in c.get("domain", "")}
+    return urls, cookies
 
 
 def scrape() -> list[dict]:
@@ -209,22 +221,26 @@ def scrape() -> list[dict]:
     listings: list[dict] = []
 
     # Phase 1 — collect listing URLs via Playwright (search pages need JS)
+    # Also grab session cookies to pass to httpx so detail requests look like
+    # a continuation of the same browser session.
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         ctx     = browser.new_context(user_agent=USER_AGENT)
         page    = ctx.new_page()
-        listing_urls = _collect_listing_urls(page)
+        listing_urls, session_cookies = _collect_listing_urls(page)
         ctx.close()
         browser.close()
 
-    print(f"[pararius] found {len(listing_urls)} listings across all pages")
+    print(f"[pararius] found {len(listing_urls)} listings, {len(session_cookies)} session cookies")
 
-    # Phase 2 — scrape detail pages via httpx (no browser = no fingerprint)
+    # Phase 2 — scrape detail pages via httpx (no browser fingerprint)
+    # 8-15s delay keeps us under Pararius's per-window rate limit (~15 req/min).
+    # On 403, _scrape_detail_httpx backs off 60s and retries once automatically.
     failed = 0
     for i, url in enumerate(listing_urls, 1):
         try:
-            _random_delay()
-            listing = _scrape_detail_httpx(url)
+            _random_delay(8.0, 15.0)
+            listing = _scrape_detail_httpx(url, cookies=session_cookies)
             listings.append(listing)
             print(f"[pararius] scraped {i}/{len(listing_urls)}: {listing['external_id']}")
         except Exception as e:
